@@ -1,0 +1,2 @@
+<?php
+echo "Another file";
