@@ -5,11 +5,14 @@ if(isset($reqUrl['path'])){
 } else {
   $file = '/index.php';
 }
+echo $file;
 
-if(!file_exists(__DIR__.'/..'.$file)){
+/*
+if(!file_exists('..'.$file)){
   echo "<h1>404 not found</h1>";
   echo "<p>The file <b>{$file}</b> does not exists in this server</p>";
   exit;
 } else {
-  require_once __DIR__.'/..'.$file;
+  require_once '..'.$file;
 }
+*/
