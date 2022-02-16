@@ -3,7 +3,7 @@ $reqUrl = parse_url($_SERVER['REQUEST_URI']);
 
 if(isset($reqUrl['path'])){
   $file = $reqUrl['path'];
-  if($reqUrl['path'] == '/'){
+  if($file == '/'){
     $file = '/index';
   }
 } else {
