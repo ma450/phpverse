@@ -8,8 +8,7 @@ if(isset($reqUrl['path'])){
 }
 
 if(!file_exists(__DIR__'/..'.$file)){
-  echo "<h1>404 not found</h1>";
-  echo "<p>The path <b>{$file}</b> does not exists in this server</p>";
+  include '404.php';
   exit;
 } else {
   require_once __DIR__'/..'.$file;
