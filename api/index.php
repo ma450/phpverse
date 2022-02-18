@@ -10,9 +10,9 @@ if(isset($reqUrl['path'])){
   $file = '/index';
 }
 
-if(!file_exists(__DIR__.'/../server'.$file.'.php')){
+if(!file_exists(__DIR__.'/..'.$file.'.php')){
   include '404.php';
   exit;
 } else {
-  require_once __DIR__.'/../server'.$file.'.php';
+  require_once __DIR__.'/..'.$file.'.php';
 }
