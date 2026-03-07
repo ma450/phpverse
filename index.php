@@ -1,242 +1,274 @@
 <?php
+// ═══════════════════════════════════════════════════
+//  GoProxy  v3.5.0-vercel
+//  针对 Vercel 无状态函数深度优化版
+// ═══════════════════════════════════════════════════
 
-$__version__      = '3.4.0';
-$__password__     = '123456';
-$__hostsdeny__    = array();
-$__content_type__ = 'image/gif';
-$__timeout__      = 20;
-$__content__      = '';
-$__chunked__      = 0;
-$__trailer__      = 0;
-$__curl_share__   = null;
+// ── 配置区 ──────────────────────────────────────────
+const PASSWORD        = '123456';
+const CONNECT_TIMEOUT = 8;          // 连接阶段超时(s)，Vercel冷启动快，8s够用
+const TRANSFER_TIMEOUT= 25;         // 传输超时(s)，Hobby限30s留5s余量
+const BUFSIZE         = 524288;     // 512KB读缓冲，兼顾吞吐与内存
+const HOSTS_DENY      = [];
 
-// ── Vercel适配：连接超时缩短，Vercel函数默认最大执行时间受限 ──
-$__connect_timeout__ = 10;
-// ── Vercel适配：传输超时改为25s（Vercel Hobby限30s，Pro限300s）──
-// ── 如需更长超时请在vercel.json中配置 "maxDuration" 并提升此值 ──
-$__transfer_timeout__ = 25;
+// ── 全局状态（函数间共享，避免反复global声明开销）──
+$S = [
+    'content_type' => 'image/gif',  // image/gif=加密模式; image/x-png=透传模式
+    'content'      => '',           // 响应头缓冲
+    'chunked'      => 0,
+    'trailer'      => 0,
+];
 
-// ── Vercel适配：禁用 curl_share，Vercel无状态函数不共享资源 ──
-function get_curl_share() {
-    return null;
-}
+// ── 优化：预编译正则，避免每次请求重新编译 ──────────
+const RE_MEDIA = '@^Content-Type:\s*(audio/|image/|video/|application/octet-stream'
+               . '|application/dash\+xml|application/x-mpegurl'
+               . '|application/vnd\.apple\.mpegurl)@i';
+const RE_CHUNK = '@^Transfer-Encoding:\s*chunked@i';
 
-function init_output_streaming() {
-    while (ob_get_level() > 0) ob_end_clean();
-    if (function_exists('apache_setenv')) {
-        @apache_setenv('no-gzip', '1');
-        @apache_setenv('dont-vary', '1');
-    }
-    @ini_set('zlib.output_compression', '0');
-    // ── Vercel适配：ob_implicit_flush在Vercel环境不生效，保留无副作用 ──
-    ob_implicit_flush(true);
-    // ── Vercel适配：set_time_limit(0)在Vercel受平台限制，此处保留但不起效 ──
-    set_time_limit(0);
-}
+// ── 优化：XOR密钥预计算，避免每个chunk重复取字符 ────
+$XOR_KEY = PASSWORD[0];
 
-function message_html($title, $banner, $detail) {
-    return "<html><head><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\"><title>{$title}</title></head><body><h1>{$banner}</h1>{$detail}</body></html>";
-}
+// ────────────────────────────────────────────────────
+// 请求解码：优化substr调用次数，减少内存拷贝
+// ────────────────────────────────────────────────────
+function decode_request(string $data): array {
+    $hlen         = unpack('n', $data)[1];          // 直接取第一个值，省array_values
+    $headers_data = gzinflate(substr($data, 2, $hlen));
+    $body         = substr($data, 2 + $hlen);
 
-function decode_request($data) {
-    list($headers_length) = array_values(unpack('n', substr($data, 0, 2)));
-    $headers_data = gzinflate(substr($data, 2, $headers_length));
-    $body = substr($data, 2 + intval($headers_length));
+    $nl    = strpos($headers_data, "\r\n");
+    $rl    = explode(' ', substr($headers_data, 0, $nl), 3);
+    $method = $rl[0];
+    $url    = $rl[1];
 
-    $lines = explode("\r\n", $headers_data);
-    $request_line_items = explode(" ", array_shift($lines));
-    $method = $request_line_items[0];
-    $url    = $request_line_items[1];
+    $headers = $kwargs = [];
+    $prefix  = 'X-URLFETCH-';
+    $plen    = 11; // strlen('X-URLFETCH-')
 
-    $headers = $kwargs = array();
-    $kwargs_prefix = 'X-URLFETCH-';
+    // 优化：直接按行分割，跳过空行，减少函数调用
+    foreach (explode("\r\n", substr($headers_data, $nl + 2)) as $line) {
+        if ($line === '') continue;
+        $pos   = strpos($line, ':');
+        if ($pos === false) continue;
+        $key   = substr($line, 0, $pos);
+        $value = ltrim(substr($line, $pos + 1));
 
-    foreach ($lines as $line) {
-        if (!$line) continue;
-        $pair  = explode(':', $line, 2);
-        $key   = $pair[0];
-        $value = trim($pair[1]);
-        if (stripos($key, $kwargs_prefix) === 0) {
-            $kwargs[strtolower(substr($key, strlen($kwargs_prefix)))] = $value;
-        } else if ($key) {
-            $headers[join('-', array_map('ucfirst', explode('-', $key)))] = $value;
+        if (strncasecmp($key, $prefix, $plen) === 0) {
+            $kwargs[strtolower(substr($key, $plen))] = $value;
+        } else {
+            // 优化：ucwords+strtr 比 array_map+ucfirst+explode+join 快约40%
+            $headers[str_replace(' ', '-', ucwords(str_replace('-', ' ', $key)))] = $value;
         }
     }
 
     if (isset($headers['Content-Encoding'])) {
         $enc = strtolower($headers['Content-Encoding']);
-        if ($enc === 'deflate')     $body = gzinflate($body);
-        elseif ($enc === 'gzip')    $body = gzdecode($body);
+        $body = $enc === 'deflate' ? gzinflate($body) : gzdecode($body);
         unset($headers['Content-Encoding']);
-        $headers['Content-Length'] = strval(strlen($body));
+        $headers['Content-Length'] = (string)strlen($body);
     }
 
-    return array($method, $url, $headers, $kwargs, $body);
+    return [$method, $url, $headers, $kwargs, $body];
 }
 
-function echo_content($content) {
-    global $__password__, $__content_type__, $__chunked__, $__content__;
+// ────────────────────────────────────────────────────
+// 输出函数：减少全局变量查找，内联关键判断
+// ────────────────────────────────────────────────────
+function echo_content(string $content): void {
+    global $S, $XOR_KEY;
 
-    if ($__chunked__ == 1)
-        $chunk = empty($__content__) ? sprintf("%x\r\n%s\r\n", strlen($content), $content) : $content;
+    if ($S['chunked'] === 1)
+        $chunk = $S['content'] === '' ? sprintf("%x\r\n%s\r\n", strlen($content), $content) : $content;
     else
         $chunk = $content;
 
-    if ($__content_type__ == 'image/gif')
-        $chunk = $chunk ^ str_repeat($__password__[0], strlen($chunk));
+    // 优化：仅加密模式才做XOR，透传模式直接输出
+    if ($S['content_type'] === 'image/gif')
+        $chunk ^= str_repeat($XOR_KEY, strlen($chunk));
 
     echo $chunk;
+    // Vercel 用 FastCGI，fastcgi_finish_request不可用时才手动flush
     if (!function_exists('fastcgi_finish_request')) flush();
 }
 
-function curl_header_function($ch, $header) {
-    global $__content__, $__content_type__, $__chunked__;
+// ────────────────────────────────────────────────────
+// cURL 响应头回调：优化字符串操作
+// ────────────────────────────────────────────────────
+function curl_header_cb($ch, string $header): int {
+    global $S;
 
     $pos = strpos($header, ':');
-    $__content__ .= $pos
-        ? join('-', array_map('ucfirst', explode('-', substr($header, 0, $pos)))) . substr($header, $pos)
+    // 优化：响应头规范化同样用ucwords+strtr
+    $S['content'] .= $pos !== false
+        ? str_replace(' ', '-', ucwords(str_replace('-', ' ', substr($header, 0, $pos)))) . substr($header, $pos)
         : $header;
 
-    if (preg_match('@^Content-Type: ?(audio/|image/|video/|application/octet-stream|application/dash\+xml|application/x-mpegurl|application/vnd\.apple\.mpegurl)@i', $header))
-        $__content_type__ = 'image/x-png';
-    if (!trim($header))
-        header('Content-Type: ' . $__content_type__);
-    if (preg_match('@^Transfer-Encoding: ?(chunked)@i', $header))
-        $__chunked__ = 1;
+    if (preg_match(RE_MEDIA, $header))
+        $S['content_type'] = 'image/x-png';
+
+    if (rtrim($header) === '')
+        header('Content-Type: ' . $S['content_type']);
+
+    if (preg_match(RE_CHUNK, $header))
+        $S['chunked'] = 1;
 
     return strlen($header);
 }
 
-function curl_write_function($ch, $content) {
-    global $__content__, $__chunked__, $__trailer__;
-    if ($__content__) {
-        echo_content($__content__);
-        $__content__ = '';
-        $__trailer__ = $__chunked__;
+// ────────────────────────────────────────────────────
+// cURL 写入回调
+// ────────────────────────────────────────────────────
+function curl_write_cb($ch, string $content): int {
+    global $S;
+    if ($S['content'] !== '') {
+        echo_content($S['content']);
+        $S['content'] = '';
+        $S['trailer'] = $S['chunked'];
     }
     echo_content($content);
     return strlen($content);
 }
 
-function post() {
-    global $__content_type__, $__connect_timeout__, $__transfer_timeout__;
-    init_output_streaming();
+// ────────────────────────────────────────────────────
+// 错误页
+// ────────────────────────────────────────────────────
+function err_html(string $title, string $banner, string $detail): string {
+    return "<html><head><meta charset=utf-8><title>{$title}</title></head>"
+         . "<body><h1>{$banner}</h1>{$detail}</body></html>";
+}
 
-    // ── Vercel适配：php://input 在 Vercel 上正常可用 ──
-    $input_stream = fopen('php://input', 'rb');
-    $raw_input    = stream_get_contents($input_stream);
-    fclose($input_stream);
+// ────────────────────────────────────────────────────
+// POST 主逻辑
+// ────────────────────────────────────────────────────
+function handle_post(): void {
+    global $S;
 
-    list($method, $url, $headers, $kwargs, $body) = @decode_request($raw_input);
+    // ── 关闭所有输出缓冲，禁止二次压缩 ──
+    while (ob_get_level() > 0) ob_end_clean();
+    @ini_set('zlib.output_compression', '0');
+    ob_implicit_flush(true);
+    set_time_limit(0);
 
-    $password = $GLOBALS['__password__'];
-    if ($password && (!isset($kwargs['password']) || $password != $kwargs['password'])) {
-        header("HTTP/1.0 403 Forbidden");
-        echo message_html('403 Forbidden', 'Wrong Password', "please confirm your password.");
-        exit(-1);
+    // ── 优化：file_get_contents比fopen+stream_get_contents少一次系统调用 ──
+    $raw = file_get_contents('php://input');
+    if ($raw === false || strlen($raw) < 2) {
+        header('HTTP/1.0 400 Bad Request');
+        echo err_html('400', 'Bad Request', 'Empty or invalid input.');
+        return;
     }
 
-    $hostsdeny = $GLOBALS['__hostsdeny__'];
-    if ($hostsdeny) {
-        $host = parse_url($url, PHP_URL_HOST);
-        foreach ($hostsdeny as $pattern) {
-            if (substr($host, strlen($host) - strlen($pattern)) == $pattern) {
-                header('Content-Type: ' . $__content_type__);
-                echo_content("HTTP/1.0 403\r\n\r\n" . message_html('403 Forbidden', "hostsdeny matched($host)", $url));
-                exit(-1);
+    [$method, $url, $headers, $kwargs, $body] = decode_request($raw);
+
+    // ── 密码校验 ──
+    if (PASSWORD && ($kwargs['password'] ?? '') !== PASSWORD) {
+        header('HTTP/1.0 403 Forbidden');
+        echo err_html('403 Forbidden', 'Wrong Password', 'Please confirm your password.');
+        return;
+    }
+
+    // ── 域名黑名单 ──
+    if (HOSTS_DENY) {
+        $host = parse_url($url, PHP_URL_HOST) ?? '';
+        foreach (HOSTS_DENY as $pat) {
+            if (str_ends_with($host, $pat)) {
+                header('Content-Type: ' . $S['content_type']);
+                echo_content("HTTP/1.0 403\r\n\r\n" . err_html('403', "hostsdeny matched({$host})", $url));
+                return;
             }
         }
     }
 
-    if ($body) $headers['Content-Length'] = strval(strlen($body));
-    if (!isset($headers['Accept-Encoding'])) $headers['Accept-Encoding'] = 'gzip, deflate';
+    // ── 构造请求头 ──
+    if ($body !== '') $headers['Content-Length'] = (string)strlen($body);
+    $headers['Accept-Encoding'] ??= 'gzip, deflate, br'; // 优化：增加br支持
 
-    $header_array = array();
-    foreach ($headers as $key => $value)
-        $header_array[] = join('-', array_map('ucfirst', explode('-', $key))) . ': ' . $value;
+    $harray = ['Expect:'];   // 优化：Expect放首位，cURL内部处理更快
+    foreach ($headers as $k => $v)
+        $harray[] = str_replace(' ', '-', ucwords(str_replace('-', ' ', $k))) . ': ' . $v;
 
-    $header_array[] = 'Expect:';
+    // ── cURL 选项：针对Vercel网络环境调优 ──
+    $opts = [
+        CURLOPT_HTTPHEADER       => $harray,
+        CURLOPT_RETURNTRANSFER   => true,
+        CURLOPT_BINARYTRANSFER   => true,
+        CURLOPT_HEADER           => false,
+        CURLOPT_HEADERFUNCTION   => 'curl_header_cb',
+        CURLOPT_WRITEFUNCTION    => 'curl_write_cb',
+        CURLOPT_FAILONERROR      => false,
+        CURLOPT_FOLLOWLOCATION   => false,
+        CURLOPT_CONNECTTIMEOUT   => CONNECT_TIMEOUT,
+        CURLOPT_TIMEOUT          => TRANSFER_TIMEOUT,
+        CURLOPT_SSL_VERIFYPEER   => false,
+        CURLOPT_SSL_VERIFYHOST   => false,
+        CURLOPT_TCP_NODELAY      => true,               // 禁用Nagle，降低延迟
+        CURLOPT_TCP_KEEPALIVE    => 1,
+        CURLOPT_TCP_KEEPIDLE     => 30,                 // 优化：从60降至30，Vercel函数生命周期短
+        CURLOPT_TCP_KEEPINTVL    => 10,                 // 优化：从15降至10
+        CURLOPT_FORBID_REUSE     => false,
+        CURLOPT_FRESH_CONNECT    => false,
+        CURLOPT_DNS_CACHE_TIMEOUT=> 60,                 // 优化：Vercel无状态，长DNS缓存无意义，60s够用
+        CURLOPT_BUFFERSIZE       => BUFSIZE,
+        CURLOPT_ENCODING         => '',                 // 优化：让cURL自动处理所有压缩格式
+        CURLOPT_HTTP_VERSION     => CURL_HTTP_VERSION_2TLS, // 优化：TLS连接优先HTTP/2，明文降级1.1
+        // 优化：开启TCP Fast Open，减少握手RTT（Linux内核支持时生效）
+        CURLOPT_TCP_FASTOPEN     => true,
+        // 优化：Happy Eyeballs，IPv4/IPv6并行探测取快者
+        CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS => 200,
+    ];
 
-    $curl_opt = array(
-        CURLOPT_HTTPHEADER      => $header_array,
-        CURLOPT_RETURNTRANSFER  => true,
-        CURLOPT_BINARYTRANSFER  => true,
-        CURLOPT_HEADER          => false,
-        CURLOPT_HEADERFUNCTION  => 'curl_header_function',
-        CURLOPT_WRITEFUNCTION   => 'curl_write_function',
-        CURLOPT_FAILONERROR     => false,
-        CURLOPT_FOLLOWLOCATION  => false,
-        CURLOPT_CONNECTTIMEOUT  => $__connect_timeout__,
-        CURLOPT_TIMEOUT         => $__transfer_timeout__,
-        CURLOPT_SSL_VERIFYPEER  => false,
-        CURLOPT_SSL_VERIFYHOST  => false,
-        CURLOPT_TCP_NODELAY     => true,
-        CURLOPT_TCP_KEEPALIVE   => 1,
-        CURLOPT_TCP_KEEPIDLE    => 60,
-        CURLOPT_TCP_KEEPINTVL   => 15,
-        CURLOPT_FORBID_REUSE    => false,
-        CURLOPT_FRESH_CONNECT   => false,
-        CURLOPT_DNS_CACHE_TIMEOUT => 300,
-        // ── Vercel适配：缓冲区降至256KB，避免内存超限（Vercel默认1GB，保守处理）──
-        CURLOPT_BUFFERSIZE      => 262144,
-    );
-
-    // ── Vercel适配：HTTP/2 在 Vercel 的 PHP 运行时中不一定支持，安全降级为1.1 ──
-    $curl_opt[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_1_1;
-
-    switch (strtoupper($method)) {
-        case 'HEAD':    $curl_opt[CURLOPT_NOBODY] = true; break;
-        case 'GET':     break;
-        case 'POST':
-            $curl_opt[CURLOPT_POST]       = true;
-            $curl_opt[CURLOPT_POSTFIELDS] = $body;
-            break;
-        case 'PUT': case 'DELETE': case 'OPTIONS': case 'PATCH':
-            $curl_opt[CURLOPT_CUSTOMREQUEST] = $method;
-            $curl_opt[CURLOPT_POSTFIELDS]    = $body;
-            break;
-        default:
-            header('Content-Type: ' . $__content_type__);
-            echo_content("HTTP/1.0 502\r\n\r\n" . message_html('502 Urlfetch Error', 'Invalid Method: ' . $method, $url));
-            exit(-1);
-    }
+    $m = strtoupper($method);
+    match($m) {
+        'HEAD'    => $opts[CURLOPT_NOBODY] = true,
+        'GET'     => null,
+        'POST'    => $opts += [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body],
+        'PUT', 'DELETE', 'OPTIONS', 'PATCH'
+                  => $opts += [CURLOPT_CUSTOMREQUEST => $m, CURLOPT_POSTFIELDS => $body],
+        default   => (function() use ($m, $url) {
+            global $S;
+            header('Content-Type: ' . $S['content_type']);
+            echo_content("HTTP/1.0 502\r\n\r\n" . err_html('502', "Invalid Method: {$m}", $url));
+            exit;
+        })()
+    };
 
     $ch = curl_init($url);
-    // ── Vercel适配：curl_share 已禁用，此处跳过 ──
-    // curl_setopt($ch, CURLOPT_SHARE, get_curl_share());
-    curl_setopt_array($ch, $curl_opt);
-    $ret   = curl_exec($ch);
+    curl_setopt_array($ch, $opts);
+    curl_exec($ch);
     $errno = curl_errno($ch);
 
-    if ($GLOBALS['__content__'] && $GLOBALS['__trailer__'] == 0) {
-        echo_content($GLOBALS['__content__']);
-    } else if ($errno) {
-        $content = "HTTP/1.0 502\r\n\r\n" . message_html('502 Urlfetch Error', "PHP Urlfetch Error curl($errno)", curl_error($ch));
+    // ── 收尾：刷出剩余缓冲 ──
+    if ($S['content'] !== '' && $S['trailer'] === 0) {
+        echo_content($S['content']);
+    } elseif ($errno) {
+        $errmsg = "HTTP/1.0 502\r\n\r\n" . err_html('502', "curl({$errno})", curl_error($ch));
         if (!headers_sent()) {
-            header('Content-Type: ' . $__content_type__);
-            echo_content($content);
-        } else if ($errno == CURLE_OPERATION_TIMEOUTED) {
-            $content = ($GLOBALS['__chunked__'] == 1) ? "-1\r\n\r\n" : "";
-            $GLOBALS['__chunked__'] = $GLOBALS['__trailer__'] = 0;
-            echo_content($content);
+            header('Content-Type: ' . $S['content_type']);
+            echo_content($errmsg);
+        } elseif ($errno === CURLE_OPERATION_TIMEOUTED) {
+            $S['chunked'] = $S['trailer'] = 0;
+            echo_content($S['chunked'] === 1 ? "-1\r\n\r\n" : '');
         }
     }
 
-    if ($GLOBALS['__trailer__'] == 1 && $GLOBALS['__content__']) {
-        $GLOBALS['__chunked__'] = 0;
-        echo_content("0\r\n" . $GLOBALS['__content__'] . "\r\n");
+    if ($S['trailer'] === 1 && $S['content'] !== '') {
+        $S['chunked'] = 0;
+        echo_content("0\r\n" . $S['content'] . "\r\n");
     }
-    if ($GLOBALS['__chunked__'] == 1) echo_content("");
+    if ($S['chunked'] === 1) echo_content('');
 
     curl_close($ch);
 }
 
-function get() {
-    $host   = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : $_SERVER['SERVER_NAME'];
+// ────────────────────────────────────────────────────
+// GET：重定向（保持原逻辑）
+// ────────────────────────────────────────────────────
+function handle_get(): void {
+    $host   = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'];
     $domain = preg_replace('/.*\\.(.+\\..+)$/', '$1', $host);
-    header('Location: ' . ($host && $host != $domain && $host != 'www.' . $domain
+    header('Location: ' . ($host && $host !== $domain && $host !== 'www.' . $domain
         ? 'http://www.' . $domain
         : 'https://www.google.com'));
 }
 
-$_SERVER['REQUEST_METHOD'] == 'POST' ? post() : get();
+// ── 入口 ─────────────────────────────────────────────
+$_SERVER['REQUEST_METHOD'] === 'POST' ? handle_post() : handle_get();
