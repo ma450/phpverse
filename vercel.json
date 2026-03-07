@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "index.php": {
+      "runtime": "vercel-php@0.7.2",
+      "maxDuration": 30
+    }
+  }
+}
