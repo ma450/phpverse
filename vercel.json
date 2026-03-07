@@ -1,8 +1,14 @@
 {
   "functions": {
-    "index.php": {
+    "api/index.php": {
       "runtime": "vercel-php@0.7.2",
       "maxDuration": 30
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index.php"
+    }
+  ]
 }
