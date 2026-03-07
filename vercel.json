@@ -5,14 +5,14 @@
       "maxDuration": 30
     }
   },
-  "routes": [
+  "rewrites": [
     {
-      "src": "/go",
-      "dest": "/api/go.php"
+      "source": "/go",
+      "destination": "/api/go.php"
     },
     {
-      "src": "/go.php",
-      "dest": "/api/go.php"
+      "source": "/go.php",
+      "destination": "/api/go.php"
     }
   ]
 }
