@@ -190,8 +190,8 @@ function post() {
         CURLOPT_BUFFERSIZE      => 524288,
     );
 
-    if (defined('CURL_HTTP_VERSION_2_0'))
-        $curl_opt[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2_0;
+    // 强制 HTTP/1.1，避免 H2 多路复用与 YouTube 视频流的兼容性问题
+    $curl_opt[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_1_1;
 
     switch (strtoupper($method)) {
         case 'HEAD':    $curl_opt[CURLOPT_NOBODY] = true; break;
