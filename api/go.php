@@ -9,27 +9,22 @@ $__content__      = '';
 $__chunked__      = 0;
 $__trailer__      = 0;
 
-// ── Vercel 适配说明 ──
-// Vercel Serverless Function 限制：
-//   - Hobby 计划：最大执行时间 10s
-//   - Pro 计划：最大执行时间 60s（可申请延长至 900s）
-//   - 无持久化内存：curl_share 跨请求共享无意义，已移除
-//   - 无 Apache 环境：apache_setenv 无效，已移除
-//   - 流式响应：ob 函数受限，已简化处理
+// Vercel Hobby=9s, Pro=55s（留5s余量），0会导致函数超时被强杀
+$__connect_timeout__  = 10;
+$__transfer_timeout__ = 55;
 
-// 连接/传输超时（适配 Vercel 限制，建议 Pro 计划使用）
-$__connect_timeout__ = 10;
-$__transfer_timeout__ = 55;   // Vercel Hobby=9s, Pro=55s（留5s余量），0会导致函数超时被强杀
+// 判断是否为视频/音频流分片请求
+function is_media_url($url, $headers) {
+    if (strpos($url, 'videoplayback') !== false) return true;
+    if (preg_match('/\.(ts|m4s|mp4|m4v|m4a|aac|webm)(\?|$)/i', $url)) return true;
+    if (isset($headers['Range'])) return true;
+    return false;
+}
 
 function init_output_streaming() {
-    // Vercel 环境中 ob_get_level() 通常为0，安全清空
     while (@ob_get_level() > 0) @ob_end_clean();
-
     // Vercel 不支持 apache_setenv，跳过
-    // 禁用 zlib 压缩防止破坏视频流
     @ini_set('zlib.output_compression', '0');
-
-    // Vercel 环境 set_time_limit 无效但调用无害，保留兼容性
     @set_time_limit(0);
 }
 
@@ -85,9 +80,6 @@ function echo_content($content) {
         $chunk = $chunk ^ str_repeat($__password__[0], strlen($chunk));
 
     echo $chunk;
-
-    // Vercel 环境中 fastcgi_finish_request 不存在，flush() 效果有限
-    // 但保留以兼容其他部署环境
     if (!function_exists('fastcgi_finish_request')) @flush();
 }
 
@@ -99,7 +91,6 @@ function curl_header_function($ch, $header) {
         ? join('-', array_map('ucfirst', explode('-', substr($header, 0, $pos)))) . substr($header, $pos)
         : $header;
 
-    // 扩展媒体类型，覆盖 YouTube/HLS/DASH 流媒体
     if (preg_match('@^Content-Type: ?(audio/|image/|video/|application/octet-stream|application/dash\+xml|application/x-mpegurl|application/vnd\.apple\.mpegurl)@i', $header))
         $__content_type__ = 'image/x-png';
     if (!trim($header))
@@ -153,11 +144,16 @@ function post() {
     if ($body) $headers['Content-Length'] = strval(strlen($body));
     if (!isset($headers['Accept-Encoding'])) $headers['Accept-Encoding'] = 'gzip, deflate';
 
+    // 媒体流分片：快速失败超时 + 禁止二次压缩
+    if (is_media_url($url, $headers)) {
+        $__connect_timeout__  = 5;   // 连不上快速失败，让播放器重试
+        $__transfer_timeout__ = 25;  // 分片小，25s足够；超时比卡死好
+        $headers['Accept-Encoding'] = 'identity'; // 视频流已压缩，禁止二次压缩
+    }
+
     $header_array = array();
     foreach ($headers as $key => $value)
         $header_array[] = join('-', array_map('ucfirst', explode('-', $key))) . ': ' . $value;
-
-    // 禁用 Expect: 100-continue，减少一次网络往返
     $header_array[] = 'Expect:';
 
     $curl_opt = array(
@@ -170,7 +166,7 @@ function post() {
         CURLOPT_FAILONERROR     => false,
         CURLOPT_FOLLOWLOCATION  => false,
         CURLOPT_CONNECTTIMEOUT  => $__connect_timeout__,
-        CURLOPT_TIMEOUT         => $__transfer_timeout__,  // Vercel: 必须有限值，不能为0
+        CURLOPT_TIMEOUT         => $__transfer_timeout__,
         CURLOPT_SSL_VERIFYPEER  => false,
         CURLOPT_SSL_VERIFYHOST  => false,
         CURLOPT_TCP_NODELAY     => true,
@@ -180,11 +176,9 @@ function post() {
         CURLOPT_FORBID_REUSE    => false,
         CURLOPT_FRESH_CONNECT   => false,
         CURLOPT_DNS_CACHE_TIMEOUT => 300,
-        // Vercel：缓冲区保持合理大小，过大可能导致内存超限（默认512MB）
-        CURLOPT_BUFFERSIZE      => 524288,  // 512KB（从1MB降低，平衡吞吐与内存）
+        CURLOPT_BUFFERSIZE      => 524288,
     );
 
-    // Vercel 的 PHP runtime 通常支持 HTTP/2
     if (defined('CURL_HTTP_VERSION_2_0'))
         $curl_opt[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2_0;
 
@@ -205,7 +199,6 @@ function post() {
             exit(-1);
     }
 
-    // Vercel：不使用 curl_share（无跨请求持久化，curl_share 在此无收益）
     $ch = curl_init($url);
     curl_setopt_array($ch, $curl_opt);
     $ret   = curl_exec($ch);
