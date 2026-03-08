@@ -7,12 +7,18 @@
   },
   "routes": [
     {
-      "src": "/go",
-      "dest": "/api/go.php"
-    },
-    {
       "src": "/(.*)",
       "dest": "/api/go.php"
+    }
+  ],
+  "regions": ["hkg1", "sin1", "nrt1"],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow" },
+        { "key": "Cache-Control", "value": "no-store, no-cache" }
+      ]
     }
   ]
 }
