@@ -1,23 +1,18 @@
 {
-  "builds": [
-    {
-      "src": "api/go.php",
-      "use": "vercel-php@0.7.2"
+  "functions": {
+    "api/go.php": {
+      "runtime": "vercel-php@0.7.2",
+      "maxDuration": 60
     }
-  ],
+  },
   "routes": [
+    {
+      "src": "/go",
+      "dest": "/api/go.php"
+    },
     {
       "src": "/(.*)",
       "dest": "/api/go.php"
-    }
-  ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        { "key": "X-Robots-Tag", "value": "noindex, nofollow" },
-        { "key": "Cache-Control", "value": "no-store, no-cache" }
-      ]
     }
   ]
 }
