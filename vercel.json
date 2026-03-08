@@ -14,5 +14,15 @@
       "src": "/(.*)",
       "dest": "/api/go.php"
     }
+  ],
+  "regions": ["hkg1", "sin1", "nrt1"],
+  "headers": [
+    {
+      "source": "/api/go.php",
+      "headers": [
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow" },
+        { "key": "Cache-Control", "value": "no-store, no-cache" }
+      ]
+    }
   ]
 }
