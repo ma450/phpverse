@@ -1,10 +1,10 @@
 {
-  "functions": {
-    "api/go.php": {
-      "runtime": "vercel-php@0.7.2",
-      "maxDuration": 60
+  "builds": [
+    {
+      "src": "api/go.php",
+      "use": "vercel-php@0.7.2"
     }
-  },
+  ],
   "routes": [
     {
       "src": "/(.*)",
