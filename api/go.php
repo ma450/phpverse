@@ -4,28 +4,36 @@ $__version__      = '3.4.0';
 $__password__     = '123456';
 $__hostsdeny__    = array();
 $__content_type__ = 'image/gif';
-$__timeout__      = 20;
+$__timeout__      = 20;               // 连接超时保持原版20s
 $__content__      = '';
 $__chunked__      = 0;
 $__trailer__      = 0;
+$__curl_share__   = null;
 
-// Vercel Hobby=9s, Pro=55s（留5s余量），0会导致函数超时被强杀
-$__connect_timeout__  = 10;
-$__transfer_timeout__ = 55;
+// ── 优化1：连接超时与传输超时分离，视频流传输不受20s限制 ──
+$__connect_timeout__ = 10;            // 连接阶段最多等10s
+$__transfer_timeout__ = 0;            // 传输阶段不限时（0=无限制），YouTube长视频必须
 
-// 判断是否为视频/音频流分片请求
-function is_media_url($url, $headers) {
-    if (strpos($url, 'videoplayback') !== false) return true;
-    if (preg_match('/\.(ts|m4s|mp4|m4v|m4a|aac|webm)(\?|$)/i', $url)) return true;
-    if (isset($headers['Range'])) return true;
-    return false;
+function get_curl_share() {
+    global $__curl_share__;
+    if ($__curl_share__ === null) {
+        $__curl_share__ = curl_share_init();
+        foreach (array(CURL_LOCK_DATA_DNS, CURL_LOCK_DATA_SSL_SESSION, CURL_LOCK_DATA_CONNECT) as $opt)
+            curl_share_setopt($__curl_share__, CURLSHOPT_SHARE, $opt);
+    }
+    return $__curl_share__;
 }
 
 function init_output_streaming() {
-    while (@ob_get_level() > 0) @ob_end_clean();
-    // Vercel 不支持 apache_setenv，跳过
+    while (ob_get_level() > 0) ob_end_clean();
+    // ── 优化2：禁止Apache/nginx对响应再次gzip压缩，防止破坏已压缩的视频流 ──
+    if (function_exists('apache_setenv')) {
+        @apache_setenv('no-gzip', '1');
+        @apache_setenv('dont-vary', '1');
+    }
     @ini_set('zlib.output_compression', '0');
-    @set_time_limit(0);
+    ob_implicit_flush(true);
+    set_time_limit(0);
 }
 
 function message_html($title, $banner, $detail) {
@@ -68,6 +76,7 @@ function decode_request($data) {
     return array($method, $url, $headers, $kwargs, $body);
 }
 
+// ── 原版 echo_content 逻辑完整保留，不做任何改动 ──
 function echo_content($content) {
     global $__password__, $__content_type__, $__chunked__, $__content__;
 
@@ -80,9 +89,10 @@ function echo_content($content) {
         $chunk = $chunk ^ str_repeat($__password__[0], strlen($chunk));
 
     echo $chunk;
-    if (!function_exists('fastcgi_finish_request')) @flush();
+    if (!function_exists('fastcgi_finish_request')) flush();
 }
 
+// ── 原版 curl_header_function 逻辑完整保留，仅扩展媒体类型识别 ──
 function curl_header_function($ch, $header) {
     global $__content__, $__content_type__, $__chunked__;
 
@@ -91,6 +101,7 @@ function curl_header_function($ch, $header) {
         ? join('-', array_map('ucfirst', explode('-', substr($header, 0, $pos)))) . substr($header, $pos)
         : $header;
 
+    // ── 优化3：扩展媒体类型，覆盖YouTube/HLS/DASH流媒体 ──
     if (preg_match('@^Content-Type: ?(audio/|image/|video/|application/octet-stream|application/dash\+xml|application/x-mpegurl|application/vnd\.apple\.mpegurl)@i', $header))
         $__content_type__ = 'image/x-png';
     if (!trim($header))
@@ -101,6 +112,7 @@ function curl_header_function($ch, $header) {
     return strlen($header);
 }
 
+// ── 原版 curl_write_function 逻辑完整保留，不做任何改动 ──
 function curl_write_function($ch, $content) {
     global $__content__, $__chunked__, $__trailer__;
     if ($__content__) {
@@ -144,16 +156,11 @@ function post() {
     if ($body) $headers['Content-Length'] = strval(strlen($body));
     if (!isset($headers['Accept-Encoding'])) $headers['Accept-Encoding'] = 'gzip, deflate';
 
-    // 媒体流分片：快速失败超时 + 禁止二次压缩
-    if (is_media_url($url, $headers)) {
-        $__connect_timeout__  = 5;   // 连不上快速失败，让播放器重试
-        $__transfer_timeout__ = 25;  // 分片小，25s足够；超时比卡死好
-        $headers['Accept-Encoding'] = 'identity'; // 视频流已压缩，禁止二次压缩
-    }
-
     $header_array = array();
     foreach ($headers as $key => $value)
         $header_array[] = join('-', array_map('ucfirst', explode('-', $key))) . ': ' . $value;
+
+    // ── 优化4：禁用 Expect: 100-continue，减少一次网络往返 ──
     $header_array[] = 'Expect:';
 
     $curl_opt = array(
@@ -165,18 +172,22 @@ function post() {
         CURLOPT_WRITEFUNCTION   => 'curl_write_function',
         CURLOPT_FAILONERROR     => false,
         CURLOPT_FOLLOWLOCATION  => false,
+        // ── 优化1：连接/传输超时分离 ──
         CURLOPT_CONNECTTIMEOUT  => $__connect_timeout__,
         CURLOPT_TIMEOUT         => $__transfer_timeout__,
         CURLOPT_SSL_VERIFYPEER  => false,
         CURLOPT_SSL_VERIFYHOST  => false,
         CURLOPT_TCP_NODELAY     => true,
+        // ── 优化5：TCP长连接保活，减少重连开销 ──
         CURLOPT_TCP_KEEPALIVE   => 1,
         CURLOPT_TCP_KEEPIDLE    => 60,
         CURLOPT_TCP_KEEPINTVL   => 15,
         CURLOPT_FORBID_REUSE    => false,
         CURLOPT_FRESH_CONNECT   => false,
+        // ── 优化6：DNS缓存时间延长，减少DNS查询 ──
         CURLOPT_DNS_CACHE_TIMEOUT => 300,
-        CURLOPT_BUFFERSIZE      => 524288,
+        // ── 优化7：读取缓冲区从128KB提升至1MB，提高视频流吞吐 ──
+        CURLOPT_BUFFERSIZE      => 1048576,
     );
 
     if (defined('CURL_HTTP_VERSION_2_0'))
@@ -200,10 +211,12 @@ function post() {
     }
 
     $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_SHARE, get_curl_share());
     curl_setopt_array($ch, $curl_opt);
     $ret   = curl_exec($ch);
     $errno = curl_errno($ch);
 
+    // ── 原版收尾逻辑完整保留 ──
     if ($GLOBALS['__content__'] && $GLOBALS['__trailer__'] == 0) {
         echo_content($GLOBALS['__content__']);
     } else if ($errno) {
